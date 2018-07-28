@@ -2,9 +2,8 @@ package main
 
 import (
 	"bytes"
-	"fmt"
-	"hash"
 	"io/ioutil"
+	"log"
 	"net"
 	"time"
 )
@@ -62,9 +61,9 @@ func (conn *tsdbConn) Close() {
 func (conn *tsdbConn) startReadAsync() {
 	buffer, err := ioutil.ReadAll(conn.conn)
 	if err != nil {
-		fmt.Println("Read error", err)
+		log.Println("Read error", err)
 	} else {
-		fmt.Println("Database returned error:", string(buffer))
+		log.Println("Database returned error:", string(buffer))
 	}
 	conn.writeChan <- nil // To stop the goroutine
 	conn.conn.Close()
@@ -73,7 +72,6 @@ func (conn *tsdbConn) startReadAsync() {
 }
 
 func (conn *tsdbConn) run() {
-	fmt.Println("RUN")
 	for {
 		buf := <-conn.writeChan
 		if buf == nil {
@@ -81,35 +79,29 @@ func (conn *tsdbConn) run() {
 		}
 		err := conn.write(buf)
 		if err != nil {
-			fmt.Println("TSDB write error", err)
+			log.Println("TSDB write error:", err)
 			break
-		} else {
-			fmt.Println("Write is OK")
 		}
 	}
-	fmt.Println("RUN...Exit")
 }
 
 func (conn *tsdbConn) reconnect() {
 	for {
 		ix := <-conn.reconnectChan
 		if ix < 0 {
-			fmt.Println("Reconnection job stopped")
+			log.Println("Reconnection job stopping")
 			break
 		}
-		fmt.Println("Connection attempt", ix)
 		if conn.connected {
-			fmt.Println("Reconnection triggered")
 			conn.conn.Close()
-		} else {
-			fmt.Println("Connection triggered")
+			conn.connected = false
 		}
 		err := conn.connect()
 		if err != nil {
-			fmt.Println("TSDB connection error", err)
+			log.Println("TSDB connection error", err)
 			conn.reconnectChan <- (ix + 1)
 		} else {
-			fmt.Println("Connection attempt successful")
+			log.Println("Connection attempt successful")
 			go conn.run()
 			go conn.startReadAsync()
 		}
@@ -122,12 +114,27 @@ func (conn *tsdbConn) Write(data []byte) {
 
 // TSDB connection pool with affinity
 type tsdbConnPool struct {
-	pool []tsdbConn
-	hash hash.Hash32
+	pool           map[string]*tsdbConn
+	targetAddr     string
+	writeTimeout   time.Duration
+	connectTimeout time.Duration
 }
 
-func (conn tsdbConnPool) Connect(addr string, connectTimeout, writeTimeout time.Duration) error {
-	return nil
+func createTsdbPool(targetAddr string, connectTimeout, writeTimeout time.Duration) *tsdbConnPool {
+	obj := new(tsdbConnPool)
+	obj.connectTimeout = connectTimeout
+	obj.writeTimeout = writeTimeout
+	obj.targetAddr = targetAddr
+	return obj
+}
+
+func (tsdb *tsdbConnPool) Write(source string, buf []byte) {
+	conn, ok := tsdb.pool[source]
+	if !ok {
+		conn = createTsdb(tsdb.targetAddr, tsdb.connectTimeout, tsdb.writeTimeout)
+		tsdb.pool[source] = conn
+	}
+	conn.Write(buf)
 }
 
 func main() {
