@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
+	"os"
 	"time"
 )
 
@@ -118,14 +121,39 @@ type tsdbConnPool struct {
 	targetAddr     string
 	writeTimeout   time.Duration
 	connectTimeout time.Duration
+	watchdog       *time.Ticker
 }
 
-func createTsdbPool(targetAddr string, connectTimeout, writeTimeout time.Duration) *tsdbConnPool {
-	obj := new(tsdbConnPool)
-	obj.connectTimeout = connectTimeout
-	obj.writeTimeout = writeTimeout
-	obj.targetAddr = targetAddr
-	return obj
+func createTsdbPool(targetAddr string, connectTimeout, writeTimeout, watchTimeout time.Duration) *tsdbConnPool {
+	tsdb := new(tsdbConnPool)
+	tsdb.pool = make(map[string]*tsdbConn)
+	tsdb.connectTimeout = connectTimeout
+	tsdb.writeTimeout = writeTimeout
+	tsdb.targetAddr = targetAddr
+	tsdb.watchdog = time.NewTicker(watchTimeout)
+	go tsdb.runWatchdog()
+	return tsdb
+}
+
+func (tsdb *tsdbConnPool) runWatchdog() {
+	for range tsdb.watchdog.C {
+		// Chose item from the pool randomly
+		sz := len(tsdb.pool)
+		if sz == 0 {
+			continue
+		}
+		ix := rand.Int() % sz
+		it := 0
+		for key, val := range tsdb.pool {
+			if it == ix {
+				log.Println("Watchdog invoked. Stopping", key)
+				val.Close()
+				delete(tsdb.pool, key)
+				continue
+			}
+			it++
+		}
+	}
 }
 
 func (tsdb *tsdbConnPool) Write(source string, buf []byte) {
@@ -137,11 +165,23 @@ func (tsdb *tsdbConnPool) Write(source string, buf []byte) {
 	conn.Write(buf)
 }
 
+func (tsdb *tsdbConnPool) Close() {
+	for _, val := range tsdb.pool {
+		val.Close()
+	}
+}
+
 func main() {
-	tsdb := createTsdb("127.0.0.1:8282", time.Second*2, time.Second*10)
+	tsdb := createTsdbPool("127.0.0.1:8282",
+		time.Second*2, time.Second*10, time.Second*20)
 	var payload bytes.Buffer
 	payload.WriteString("hello")
-	tsdb.Write(payload.Bytes())
+	tsdb.Write("127.0.0.1:8181", payload.Bytes())
+	reader := bufio.NewReader(os.Stdin)
+	text, _ := reader.ReadString('\n')
+	payload.Reset()
+	payload.WriteString(text)
+	tsdb.Write("127.0.0.1:0303", payload.Bytes())
 	time.Sleep(1000 * time.Second)
 	/*
 		var tsdb tsdbConn
