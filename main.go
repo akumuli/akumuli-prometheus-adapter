@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -122,6 +123,7 @@ type tsdbConnPool struct {
 	writeTimeout   time.Duration
 	connectTimeout time.Duration
 	watchdog       *time.Ticker
+	rwlock         sync.RWMutex
 }
 
 func createTsdbPool(targetAddr string, connectTimeout, writeTimeout, watchTimeout time.Duration) *tsdbConnPool {
@@ -138,37 +140,52 @@ func createTsdbPool(targetAddr string, connectTimeout, writeTimeout, watchTimeou
 func (tsdb *tsdbConnPool) runWatchdog() {
 	for range tsdb.watchdog.C {
 		// Chose item from the pool randomly
+		tsdb.rwlock.RLock()
 		sz := len(tsdb.pool)
-		if sz == 0 {
+		tsdb.rwlock.RUnlock()
+		if sz == 0 { // TODO: replace with 'if sz < 2 {'
 			continue
 		}
 		ix := rand.Int() % sz
 		it := 0
+		tsdb.rwlock.Lock()
 		for key, val := range tsdb.pool {
 			if it == ix {
 				log.Println("Watchdog invoked. Stopping", key)
 				val.Close()
 				delete(tsdb.pool, key)
-				continue
+				break
 			}
 			it++
 		}
+		tsdb.rwlock.Unlock()
 	}
 }
 
 func (tsdb *tsdbConnPool) Write(source string, buf []byte) {
+	tsdb.rwlock.RLock()
 	conn, ok := tsdb.pool[source]
+	tsdb.rwlock.RUnlock()
 	if !ok {
+		// It is possible that this branch will be executed twice for the same
+		// key, but that's OK. Normally, it won't be executed often. And the
+		// method will be called with the same source by the same client. I
+		// expect that parallel calls to this method will always have different
+		// 'source' values.
+		tsdb.rwlock.Lock()
 		conn = createTsdb(tsdb.targetAddr, tsdb.connectTimeout, tsdb.writeTimeout)
 		tsdb.pool[source] = conn
+		tsdb.rwlock.Unlock()
 	}
 	conn.Write(buf)
 }
 
 func (tsdb *tsdbConnPool) Close() {
+	tsdb.rwlock.Lock()
 	for _, val := range tsdb.pool {
 		val.Close()
 	}
+	tsdb.rwlock.Unlock()
 }
 
 func main() {
