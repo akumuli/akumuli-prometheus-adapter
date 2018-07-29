@@ -1,14 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -58,8 +60,10 @@ func (conn *tsdbConn) write(data []byte) error {
 func (conn *tsdbConn) Close() {
 	conn.reconnectChan <- -1
 	conn.writeChan <- nil
-	conn.conn.Close()
-	conn.connected = false
+	if conn.connected {
+		conn.conn.Close()
+		conn.connected = false
+	}
 }
 
 func (conn *tsdbConn) startReadAsync() {
@@ -185,6 +189,7 @@ func (tsdb *tsdbConnPool) Close() {
 	for _, val := range tsdb.pool {
 		val.Close()
 	}
+	tsdb.watchdog.Stop()
 	tsdb.rwlock.Unlock()
 }
 
@@ -194,12 +199,17 @@ func main() {
 	var payload bytes.Buffer
 	payload.WriteString("hello")
 	tsdb.Write("127.0.0.1:8181", payload.Bytes())
-	reader := bufio.NewReader(os.Stdin)
-	text, _ := reader.ReadString('\n')
-	payload.Reset()
-	payload.WriteString(text)
-	tsdb.Write("127.0.0.1:0303", payload.Bytes())
-	time.Sleep(1000 * time.Second)
+	// reader := bufio.NewReader(os.Stdin)
+	// text, _ := reader.ReadString('\n')
+	// payload.Reset()
+	// payload.WriteString(text)
+	// tsdb.Write("127.0.0.1:0303", payload.Bytes())
+	// Test stopping
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
+	tsdb.Close()
+	fmt.Println("TSDB Stopped")
 	/*
 		var tsdb tsdbConn
 		err := tsdb.Connect("127.0.0.1:8282", time.Second*10, time.Second*10)
