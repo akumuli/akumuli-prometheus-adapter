@@ -151,7 +151,7 @@ func (tsdb *tsdbConnPool) runWatchdog() {
 		tsdb.rwlock.RLock()
 		sz := len(tsdb.pool)
 		tsdb.rwlock.RUnlock()
-		if sz == 0 { // TODO: replace with 'if sz < 2 {'
+		if sz < 2 {
 			continue
 		}
 		ix := rand.Int() % sz
@@ -200,7 +200,7 @@ func (tsdb *tsdbConnPool) Close() {
 func main() {
 
 	tsdb := createTsdbPool("127.0.0.1:8282",
-		time.Second*2, time.Second*10, time.Second*20)
+		time.Second*1, time.Second*10, time.Second*100)
 
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
 
