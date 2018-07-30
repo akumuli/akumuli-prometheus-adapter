@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"math/rand"
 	"net"
-	"os"
-	"os/signal"
+	"net/http"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+	"github.com/prometheus/prometheus/prompb"
 )
 
 type tsdbConn struct {
@@ -194,78 +198,55 @@ func (tsdb *tsdbConnPool) Close() {
 }
 
 func main() {
+
 	tsdb := createTsdbPool("127.0.0.1:8282",
 		time.Second*2, time.Second*10, time.Second*20)
-	var payload bytes.Buffer
-	payload.WriteString("hello")
-	tsdb.Write("127.0.0.1:8181", payload.Bytes())
-	// reader := bufio.NewReader(os.Stdin)
-	// text, _ := reader.ReadString('\n')
-	// payload.Reset()
-	// payload.WriteString(text)
-	// tsdb.Write("127.0.0.1:0303", payload.Bytes())
-	// Test stopping
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	<-sigs
-	tsdb.Close()
-	fmt.Println("TSDB Stopped")
-	/*
-		var tsdb tsdbConn
-		err := tsdb.Connect("127.0.0.1:8282", time.Second*10, time.Second*10)
+
+	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+
+		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
-			fmt.Println("Can't connect to TSDB", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+		reqBuf, err := snappy.Decode(nil, compressed)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-			compressed, err := ioutil.ReadAll(r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
+		var req prompb.WriteRequest
+		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-			reqBuf, err := snappy.Decode(nil, compressed)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			var req prompb.WriteRequest
-			if err := proto.Unmarshal(reqBuf, &req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			fmt.Println("remote addr: ", r.RemoteAddr)
-
-			for _, ts := range req.Timeseries {
-				var tags bytes.Buffer
-				var metric string
-				for _, l := range ts.Labels {
-					if l.Name != "__name__" {
-						if strings.Count(l.Value, " ") == 0 {
-							tags.WriteString(fmt.Sprintf(" %s=%s", l.Name, l.Value))
-						}
-					} else {
-						metric = l.Value
+		for _, ts := range req.Timeseries {
+			var tags bytes.Buffer
+			var metric string
+			for _, l := range ts.Labels {
+				if l.Name != "__name__" {
+					if strings.Count(l.Value, " ") == 0 {
+						tags.WriteString(fmt.Sprintf(" %s=%s", l.Name, l.Value))
 					}
-				}
-				sname := fmt.Sprintf("+%s%s\r\n", metric, tags.String())
-				var payload bytes.Buffer
-				for _, s := range ts.Samples {
-					if !math.IsNaN(s.Value) {
-						payload.WriteString(sname)
-						dt := time.Unix(s.Timestamp/1000, (s.Timestamp%1000)*1000000).UTC()
-						payload.WriteString(fmt.Sprintf("+%s\r\n", dt.Format("20060102T150405")))
-						payload.WriteString(fmt.Sprintf("+%.17g\r\n", s.Value))
-						tsdb.write(payload)
-					}
+				} else {
+					metric = l.Value
 				}
 			}
-		})
+			sname := fmt.Sprintf("+%s%s\r\n", metric, tags.String())
+			var payload bytes.Buffer
+			for _, s := range ts.Samples {
+				if !math.IsNaN(s.Value) {
+					payload.WriteString(sname)
+					dt := time.Unix(s.Timestamp/1000, (s.Timestamp%1000)*1000000).UTC()
+					payload.WriteString(fmt.Sprintf("+%s\r\n", dt.Format("20060102T150405")))
+					payload.WriteString(fmt.Sprintf("+%.17g\r\n", s.Value))
+					tsdb.Write(r.RemoteAddr, payload.Bytes())
+				}
+			}
+		}
+	})
 
-		http.ListenAndServe("127.0.0.1:9201", nil)
-	*/
+	http.ListenAndServe("127.0.0.1:9201", nil)
 }
