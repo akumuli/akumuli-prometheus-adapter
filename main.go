@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -197,10 +198,50 @@ func (tsdb *tsdbConnPool) Close() {
 	tsdb.rwlock.Unlock()
 }
 
-func main() {
+type config struct {
+	writeTimeout      time.Duration
+	reconnectInterval time.Duration
+	idleTime          time.Duration
+	tsdbAddress       string
+	tsdbPort          int
+}
 
-	tsdb := createTsdbPool("127.0.0.1:8282",
-		time.Second*1, time.Second*10, time.Second*100)
+func main() {
+	var cfg config
+	flag.DurationVar(&cfg.writeTimeout,
+		"write-timeout",
+		time.Second*10,
+		"TSDB write timeout",
+	)
+
+	flag.DurationVar(&cfg.reconnectInterval,
+		"reconnect-interval",
+		time.Second*5,
+		"Reconnect interval",
+	)
+
+	flag.DurationVar(&cfg.idleTime,
+		"idle-time",
+		time.Second*60,
+		"Interval after which idle connection should be closed",
+	)
+
+	flag.StringVar(&cfg.tsdbAddress,
+		"host",
+		"localhost",
+		"TSDB host address",
+	)
+
+	flag.IntVar(&cfg.tsdbPort,
+		"port",
+		8282,
+		"TSDB port number",
+	)
+
+	endpoint := fmt.Sprintf("%s:%d", cfg.tsdbAddress, cfg.tsdbPort)
+
+	tsdb := createTsdbPool(endpoint,
+		cfg.reconnectInterval, cfg.writeTimeout, cfg.idleTime)
 
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
 
