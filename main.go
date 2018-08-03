@@ -268,11 +268,13 @@ func main() {
 			var metric string
 			for _, l := range ts.Labels {
 				if l.Name != "__name__" {
+					sval := strings.Replace(l.Value, " ", "\\ ", -1)
+					sname := strings.Replace(l.Name, " ", "\\ ", -1)
 					if strings.Count(l.Value, " ") == 0 {
-						tags.WriteString(fmt.Sprintf(" %s=%s", l.Name, l.Value))
+						tags.WriteString(fmt.Sprintf(" %s=%s", sname, sval))
 					}
 				} else {
-					metric = l.Value
+					metric = strings.Replace(l.Value, " ", "\\ ", -1)
 				}
 			}
 			sname := fmt.Sprintf("+%s%s\r\n", metric, tags.String())
