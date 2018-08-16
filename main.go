@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -12,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -245,28 +245,74 @@ func buildCommand(q *prompb.Query) ([]byte, error) {
 	return json.Marshal(query)
 }
 
+func concatLabels(labels map[string]string) string {
+	// 0xff cannot cannot occur in valid UTF-8 sequences, so use it
+	// as a separator here.
+	separator := "\xff"
+	pairs := make([]string, 0, len(labels))
+	for k, v := range labels {
+		pairs = append(pairs, k+separator+v)
+	}
+	return strings.Join(pairs, separator)
+}
+
 func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
+	series := map[string]*prompb.TimeSeries{}
 	for _, query := range req.GetQueries() {
-		//...
 		tsdbq, err := buildCommand(query)
 		if err != nil {
+			// TODO: remove
 			fmt.Println(err.Error())
 			return nil, err
 		}
 		resp, httperr := http.Post("http://localhost:8181/api/query", "application/json", bytes.NewReader(tsdbq))
 		if httperr != nil {
+			// TODO: remove
 			fmt.Println(httperr.Error())
 			return nil, httperr
 		}
 		defer resp.Body.Close()
 		output, readerr := ioutil.ReadAll(resp.Body)
 		if readerr != nil {
+			// TODO: remove
 			fmt.Println(readerr.Error())
 			return nil, readerr
 		}
-		fmt.Println(string(output))
+
+		// Parse output
+		ixline := 0
+		lines := strings.Split(string(output), "\r\n")
+		var name string
+		var timestamp time.Time
+		var value float64
+		layout := "20060102T150405.999999999"
+		for _, line := range lines {
+			switch ixline % 3 {
+			case 0:
+				// Parse series name
+				name = line[1:len(line)]
+			case 1:
+				// Parse timestamp
+				timestamp, err = time.Parse(layout, line[1:len(line)])
+				if err != nil {
+					return nil, err
+				}
+			case 2:
+				// Parse float value
+				value, err = strconv.ParseFloat(line[1:len(line)], 64)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
-	return nil, errors.New("Not implemented")
+	// Build response
+	resp := prompb.ReadResponse{
+		Results: []*prompb.QueryResult{
+			{Timeseries: make([]*prompb.TimeSeries, 0, len(series))},
+		},
+	}
+	return &resp, nil
 }
 
 type config struct {
@@ -336,9 +382,26 @@ func main() {
 		}
 
 		var client tsdbClient
-		_, _ = client.Read(&req)
+		resp, err := client.Read(&req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		http.Error(w, "not implemented", http.StatusNotFound)
+		data, err := proto.Marshal(resp)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Encoding", "snappy")
+
+		compressed = snappy.Encode(nil, data)
+		if _, err := w.Write(compressed); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	})
 
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
