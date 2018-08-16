@@ -245,15 +245,44 @@ func buildCommand(q *prompb.Query) ([]byte, error) {
 	return json.Marshal(query)
 }
 
-func concatLabels(labels map[string]string) string {
-	// 0xff cannot cannot occur in valid UTF-8 sequences, so use it
-	// as a separator here.
-	separator := "\xff"
-	pairs := make([]string, 0, len(labels))
-	for k, v := range labels {
-		pairs = append(pairs, k+separator+v)
+func toLabelPairs(series string) []*prompb.Label {
+	items := strings.Split(series, " ")
+	pairs := make([]*prompb.Label, 0, len(items))
+	for _, token := range items[1:] {
+		kv := strings.Split(token, "=")
+		if len(kv) != 2 {
+			continue
+		}
+		pairs = append(pairs, &prompb.Label{
+			Name:  kv[0],
+			Value: kv[1],
+		})
 	}
-	return strings.Join(pairs, separator)
+	pairs = append(pairs, &prompb.Label{
+		Name:  "__name__",
+		Value: items[0],
+	})
+	return pairs
+}
+
+func appendResult(labelsToSeries map[string]*prompb.TimeSeries,
+	name string,
+	timestamp time.Time,
+	value float64) error {
+
+	tss, ok := labelsToSeries[name]
+	if !ok {
+		tss = &prompb.TimeSeries{
+			Labels: toLabelPairs(name),
+		}
+		labelsToSeries[name] = tss
+	}
+	tss.Samples = append(tss.Samples, &prompb.Sample{
+		Timestamp: timestamp.UnixNano(),
+		Value:     value,
+	})
+
+	return nil
 }
 
 func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
@@ -303,6 +332,10 @@ func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
 				if err != nil {
 					return nil, err
 				}
+				err = appendResult(series, name, timestamp, value)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -311,6 +344,9 @@ func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
 		Results: []*prompb.QueryResult{
 			{Timeseries: make([]*prompb.TimeSeries, 0, len(series))},
 		},
+	}
+	for _, ts := range series {
+		resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
 	}
 	return &resp, nil
 }
