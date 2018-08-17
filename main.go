@@ -18,6 +18,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -222,7 +223,7 @@ func buildCommand(q *prompb.Query) ([]byte, error) {
 	var query tsdbQuery
 	query.Where = make(map[string]string)
 	for _, m := range q.Matchers {
-		if m.Name == "__name__" {
+		if m.Name == model.MetricNameLabel {
 			switch m.Type {
 			case prompb.LabelMatcher_EQ:
 				query.MetricName = escapeSpaces(m.Value)
@@ -259,7 +260,7 @@ func toLabelPairs(series string) []*prompb.Label {
 		})
 	}
 	pairs = append(pairs, &prompb.Label{
-		Name:  "__name__",
+		Name:  model.MetricNameLabel,
 		Value: items[0],
 	})
 	return pairs
@@ -309,13 +310,15 @@ func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
 		}
 
 		// Parse output
-		ixline := 0
 		lines := strings.Split(string(output), "\r\n")
 		var name string
 		var timestamp time.Time
 		var value float64
 		layout := "20060102T150405.999999999"
-		for _, line := range lines {
+		for ixline, line := range lines {
+			if len(line) == 0 {
+				continue
+			}
 			switch ixline % 3 {
 			case 0:
 				// Parse series name
@@ -401,18 +404,21 @@ func main() {
 
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
+			log.Println("Can't read response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {
+			log.Println("Can't decode response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		var req prompb.ReadRequest
 		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+			log.Println("Can't unmarshal response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -420,12 +426,21 @@ func main() {
 		var client tsdbClient
 		resp, err := client.Read(&req)
 		if err != nil {
+			log.Println("Can't generate response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
+		json, err := json.Marshal(resp)
+		if err != nil {
+			log.Println("Can't marshal json:", err.Error())
+		} else {
+			log.Println(string(json))
+		}
+
 		data, err := proto.Marshal(resp)
 		if err != nil {
+			log.Println("Can't marshal response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -435,6 +450,7 @@ func main() {
 
 		compressed = snappy.Encode(nil, data)
 		if _, err := w.Write(compressed); err != nil {
+			log.Println("Can't send response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
