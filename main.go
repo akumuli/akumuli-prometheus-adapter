@@ -279,7 +279,7 @@ func appendResult(labelsToSeries map[string]*prompb.TimeSeries,
 		labelsToSeries[name] = tss
 	}
 	tss.Samples = append(tss.Samples, &prompb.Sample{
-		Timestamp: timestamp.UnixNano(),
+		Timestamp: timestamp.UnixNano() / 1000000,
 		Value:     value,
 	})
 
@@ -429,13 +429,6 @@ func main() {
 			log.Println("Can't generate response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
-		}
-
-		json, err := json.Marshal(resp)
-		if err != nil {
-			log.Println("Can't marshal json:", err.Error())
-		} else {
-			log.Println(string(json))
 		}
 
 		data, err := proto.Marshal(resp)
