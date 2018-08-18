@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -10,14 +11,20 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
+
+func escapeSpaces(name string) string {
+	return strings.Replace(name, " ", "\\ ", -1)
+}
 
 type tsdbConn struct {
 	conn           net.Conn
@@ -44,7 +51,6 @@ func createTsdb(addr string, connectTimeout, writeTimeout time.Duration) *tsdbCo
 }
 
 func (conn *tsdbConn) connect() error {
-	time.Sleep(conn.connectTimeout)
 	c, err := net.Dial("tcp", conn.addr)
 	if err == nil {
 		conn.conn = c
@@ -108,6 +114,7 @@ func (conn *tsdbConn) reconnect() {
 		if conn.connected {
 			conn.conn.Close()
 			conn.connected = false
+			time.Sleep(conn.connectTimeout)
 		}
 		err := conn.connect()
 		if err != nil {
@@ -198,12 +205,161 @@ func (tsdb *tsdbConnPool) Close() {
 	tsdb.rwlock.Unlock()
 }
 
+type tsdbClient struct {
+	Endpoint string
+}
+
+func (c *tsdbClient) SetEndpoint(host string, port int) {
+	c.Endpoint = fmt.Sprintf("http://%s:%d/api/query", host, port)
+}
+
+type tsdbQueryRange struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type tsdbQuery struct {
+	MetricName string            `json:"select"`
+	TimeRange  tsdbQueryRange    `json:"range"`
+	Where      map[string]string `json:"where"`
+}
+
+func buildCommand(q *prompb.Query) ([]byte, error) {
+	var query tsdbQuery
+	query.Where = make(map[string]string)
+	for _, m := range q.Matchers {
+		if m.Name == model.MetricNameLabel {
+			switch m.Type {
+			case prompb.LabelMatcher_EQ:
+				query.MetricName = escapeSpaces(m.Value)
+			default:
+				return nil, fmt.Errorf("non-equal or regex matchers are not supported on the metric name yet")
+			}
+			continue
+		}
+
+		switch m.Type {
+		case prompb.LabelMatcher_EQ:
+			query.Where[m.Name] = escapeSpaces(m.Value)
+		default:
+			return nil, fmt.Errorf("unknown match type %v", m.Type)
+		}
+	}
+	query.TimeRange.From = fmt.Sprintf("%v", q.StartTimestampMs*1000000)
+	query.TimeRange.To = fmt.Sprintf("%v", q.EndTimestampMs*1000000)
+
+	return json.Marshal(query)
+}
+
+func toLabelPairs(series string) []*prompb.Label {
+	items := strings.Split(series, " ")
+	pairs := make([]*prompb.Label, 0, len(items))
+	for _, token := range items[1:] {
+		kv := strings.Split(token, "=")
+		if len(kv) != 2 {
+			continue
+		}
+		pairs = append(pairs, &prompb.Label{
+			Name:  kv[0],
+			Value: kv[1],
+		})
+	}
+	pairs = append(pairs, &prompb.Label{
+		Name:  model.MetricNameLabel,
+		Value: items[0],
+	})
+	return pairs
+}
+
+func appendResult(labelsToSeries map[string]*prompb.TimeSeries,
+	name string,
+	timestamp time.Time,
+	value float64) error {
+
+	tss, ok := labelsToSeries[name]
+	if !ok {
+		tss = &prompb.TimeSeries{
+			Labels: toLabelPairs(name),
+		}
+		labelsToSeries[name] = tss
+	}
+	tss.Samples = append(tss.Samples, &prompb.Sample{
+		Timestamp: timestamp.UnixNano() / 1000000,
+		Value:     value,
+	})
+
+	return nil
+}
+
+func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
+	series := map[string]*prompb.TimeSeries{}
+	for _, query := range req.GetQueries() {
+		tsdbq, err := buildCommand(query)
+		if err != nil {
+			return nil, err
+		}
+		resp, httperr := http.Post(c.Endpoint, "application/json", bytes.NewReader(tsdbq))
+		if httperr != nil {
+			return nil, httperr
+		}
+		defer resp.Body.Close()
+		output, readerr := ioutil.ReadAll(resp.Body)
+		if readerr != nil {
+			return nil, readerr
+		}
+
+		// Parse output
+		lines := strings.Split(string(output), "\r\n")
+		var name string
+		var timestamp time.Time
+		var value float64
+		layout := "20060102T150405.999999999"
+		for ixline, line := range lines {
+			if len(line) == 0 {
+				continue
+			}
+			switch ixline % 3 {
+			case 0:
+				// Parse series name
+				name = line[1:len(line)]
+			case 1:
+				// Parse timestamp
+				timestamp, err = time.Parse(layout, line[1:len(line)])
+				if err != nil {
+					return nil, err
+				}
+			case 2:
+				// Parse float value
+				value, err = strconv.ParseFloat(line[1:len(line)], 64)
+				if err != nil {
+					return nil, err
+				}
+				err = appendResult(series, name, timestamp, value)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	// Build response
+	resp := prompb.ReadResponse{
+		Results: []*prompb.QueryResult{
+			{Timeseries: make([]*prompb.TimeSeries, 0, len(series))},
+		},
+	}
+	for _, ts := range series {
+		resp.Results[0].Timeseries = append(resp.Results[0].Timeseries, ts)
+	}
+	return &resp, nil
+}
+
 type config struct {
 	writeTimeout      time.Duration
 	reconnectInterval time.Duration
 	idleTime          time.Duration
 	tsdbAddress       string
 	tsdbPort          int
+	tsdbHTTPPort      int
 }
 
 func main() {
@@ -235,13 +391,71 @@ func main() {
 	flag.IntVar(&cfg.tsdbPort,
 		"port",
 		8282,
-		"TSDB port number",
+		"TSDB TCP endpoint port number",
+	)
+
+	flag.IntVar(&cfg.tsdbHTTPPort,
+		"http-port",
+		8181,
+		"TSDB HTTP API endpoint port number",
 	)
 
 	endpoint := fmt.Sprintf("%s:%d", cfg.tsdbAddress, cfg.tsdbPort)
 
 	tsdb := createTsdbPool(endpoint,
 		cfg.reconnectInterval, cfg.writeTimeout, cfg.idleTime)
+
+	var httpClient tsdbClient
+	httpClient.SetEndpoint(cfg.tsdbAddress, cfg.tsdbHTTPPort)
+
+	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("Read request")
+
+		compressed, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			log.Println("Can't read response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		reqBuf, err := snappy.Decode(nil, compressed)
+		if err != nil {
+			log.Println("Can't decode response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var req prompb.ReadRequest
+		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+			log.Println("Can't unmarshal response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		resp, err := httpClient.Read(&req)
+		if err != nil {
+			log.Println("Can't generate response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		data, err := proto.Marshal(resp)
+		if err != nil {
+			log.Println("Can't marshal response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Encoding", "snappy")
+
+		compressed = snappy.Encode(nil, data)
+		if _, err := w.Write(compressed); err != nil {
+			log.Println("Can't send response, error:", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	})
 
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
 
@@ -268,11 +482,11 @@ func main() {
 			var metric string
 			for _, l := range ts.Labels {
 				if l.Name != "__name__" {
-					sval := strings.Replace(l.Value, " ", "\\ ", -1)
-					sname := strings.Replace(l.Name, " ", "\\ ", -1)
+					sval := escapeSpaces(l.Value)
+					sname := escapeSpaces(l.Name)
 					tags.WriteString(fmt.Sprintf(" %s=%s", sname, sval))
 				} else {
-					metric = strings.Replace(l.Value, " ", "\\ ", -1)
+					metric = escapeSpaces(l.Value)
 				}
 			}
 			sname := fmt.Sprintf("+%s%s\r\n", metric, tags.String())
@@ -289,5 +503,5 @@ func main() {
 		}
 	})
 
-	http.ListenAndServe("127.0.0.1:9201", nil)
+	http.ListenAndServe(":9201", nil)
 }
