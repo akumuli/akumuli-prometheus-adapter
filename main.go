@@ -51,7 +51,6 @@ func createTsdb(addr string, connectTimeout, writeTimeout time.Duration) *tsdbCo
 }
 
 func (conn *tsdbConn) connect() error {
-	time.Sleep(conn.connectTimeout)
 	c, err := net.Dial("tcp", conn.addr)
 	if err == nil {
 		conn.conn = c
@@ -115,6 +114,7 @@ func (conn *tsdbConn) reconnect() {
 		if conn.connected {
 			conn.conn.Close()
 			conn.connected = false
+			time.Sleep(conn.connectTimeout)
 		}
 		err := conn.connect()
 		if err != nil {
@@ -206,6 +206,11 @@ func (tsdb *tsdbConnPool) Close() {
 }
 
 type tsdbClient struct {
+	Endpoint string
+}
+
+func (c *tsdbClient) SetEndpoint(host string, port int) {
+	c.Endpoint = fmt.Sprintf("http://%s:%d/api/query", host, port)
 }
 
 type tsdbQueryRange struct {
@@ -291,21 +296,15 @@ func (c *tsdbClient) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
 	for _, query := range req.GetQueries() {
 		tsdbq, err := buildCommand(query)
 		if err != nil {
-			// TODO: remove
-			fmt.Println(err.Error())
 			return nil, err
 		}
-		resp, httperr := http.Post("http://localhost:8181/api/query", "application/json", bytes.NewReader(tsdbq))
+		resp, httperr := http.Post(c.Endpoint, "application/json", bytes.NewReader(tsdbq))
 		if httperr != nil {
-			// TODO: remove
-			fmt.Println(httperr.Error())
 			return nil, httperr
 		}
 		defer resp.Body.Close()
 		output, readerr := ioutil.ReadAll(resp.Body)
 		if readerr != nil {
-			// TODO: remove
-			fmt.Println(readerr.Error())
 			return nil, readerr
 		}
 
@@ -360,6 +359,7 @@ type config struct {
 	idleTime          time.Duration
 	tsdbAddress       string
 	tsdbPort          int
+	tsdbHTTPPort      int
 }
 
 func main() {
@@ -391,13 +391,22 @@ func main() {
 	flag.IntVar(&cfg.tsdbPort,
 		"port",
 		8282,
-		"TSDB port number",
+		"TSDB TCP endpoint port number",
+	)
+
+	flag.IntVar(&cfg.tsdbHTTPPort,
+		"http-port",
+		8181,
+		"TSDB HTTP API endpoint port number",
 	)
 
 	endpoint := fmt.Sprintf("%s:%d", cfg.tsdbAddress, cfg.tsdbPort)
 
 	tsdb := createTsdbPool(endpoint,
 		cfg.reconnectInterval, cfg.writeTimeout, cfg.idleTime)
+
+	var httpClient tsdbClient
+	httpClient.SetEndpoint(cfg.tsdbAddress, cfg.tsdbHTTPPort)
 
 	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Read request")
@@ -423,8 +432,7 @@ func main() {
 			return
 		}
 
-		var client tsdbClient
-		resp, err := client.Read(&req)
+		resp, err := httpClient.Read(&req)
 		if err != nil {
 			log.Println("Can't generate response, error:", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -495,5 +503,5 @@ func main() {
 		}
 	})
 
-	http.ListenAndServe("127.0.0.1:9201", nil)
+	http.ListenAndServe(":9201", nil)
 }
